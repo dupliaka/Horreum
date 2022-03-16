@@ -67,6 +67,10 @@ public class TableReport extends PanacheEntityBase {
       @NotNull
       public ArrayNode values;
 
+      @Type(type = "io.hyperfoil.tools.horreum.entity.converter.JsonUserType")
+      @NotNull
+      public ArrayNode relative_difference;
+
       @Override
       public String toString() {
          return "RunData{" +
@@ -74,7 +78,8 @@ public class TableReport extends PanacheEntityBase {
                ", category='" + category + '\'' +
                ", series='" + series + '\'' +
                ", label='" + label + '\'' +
-               ", values=" + values +
+               ", values=" + values + '\'' +
+               ", relativeValues=" + relative_difference +
                '}';
       }
    }

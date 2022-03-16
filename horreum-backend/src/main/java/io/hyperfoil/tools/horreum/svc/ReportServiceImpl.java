@@ -3,14 +3,7 @@ package io.hyperfoil.tools.horreum.svc;
 import java.io.ByteArrayOutputStream;
 import java.sql.Timestamp;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -21,7 +14,10 @@ import javax.inject.Inject;
 import javax.persistence.EntityManager;
 import javax.persistence.Query;
 import javax.transaction.Transactional;
+import javax.validation.constraints.NotNull;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import org.graalvm.polyglot.Context;
 import org.graalvm.polyglot.PolyglotException;
 import org.graalvm.polyglot.Value;
@@ -41,6 +37,8 @@ import io.quarkus.hibernate.orm.panache.PanacheQuery;
 import io.quarkus.panache.common.Sort;
 import io.quarkus.security.identity.SecurityIdentity;
 import io.quarkus.vertx.ConsumeEvent;
+
+import static org.keycloak.util.JsonSerialization.mapper;
 
 @WithRoles
 public class ReportServiceImpl implements ReportService {
@@ -334,17 +332,35 @@ public class ReportServiceImpl implements ReportService {
          assert config.labelFormatter == null;
          labels = series.stream().map(row -> new Object[] { row[0], "" }).collect(Collectors.toList());
       }
+
+      //TODO remove
+      List<Integer> baseLineRunIds = Stream.of(22, 23).collect(Collectors.toList());
+
       Map<Integer, TableReport.RunData> runData = getRunData(config, runCategories, series, labels);
       log.debugf("Run data: %s", runData);
 
+      Map<Integer, TableReport.RunData> baseLineRunData = runData.entrySet().stream()
+              .filter(id -> baseLineRunIds.contains(id.getKey()))
+              .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+      log.debugf("Run baseline: %s", baseLineRunData);
+
       @SuppressWarnings("unchecked")
       Map<Integer, Timestamp> timestamps = ((Stream<Object[]>) timestampQuery.getResultStream())
-            .collect(Collectors.toMap(row -> (Integer) row[0], row -> (Timestamp) row[1]));
+              .collect(Collectors.toMap(row -> (Integer) row[0], row -> (Timestamp) row[1]));
       // TODO: customizable time range
       List<Integer> runIds = getFinalRunIds(timestamps, runData);
+      
+      setValues(config, baseLineRunData, baseLineRunIds, null);
+      setValues(config, runData, runIds, baseLineRunIds);
+
+      report.runData = runIds.stream().map(runData::get).collect(Collectors.toList());
+      return report;
+   }
+
+   private void setValues(TableReportConfig config, Map<Integer, TableReport.RunData> runData, List<Integer> runIds,  List<Integer> baseLineRunIds) {
       List<List<Object[]>> values = config.components.stream()
-            .map(component -> selectByRuns(component.accessors, runIds))
-            .collect(Collectors.toList());
+              .map(component -> selectByRuns(component.accessors, runIds))
+              .collect(Collectors.toList());
       executeInContext(config, context -> {
          for (int i = 0; i < values.size(); i++) {
             List<Object[]> valuesForComponent = values.get(i);
@@ -352,15 +368,34 @@ public class ReportServiceImpl implements ReportService {
             for (Object[] row : valuesForComponent) {
                Integer runId = (Integer) row[0];
                TableReport.RunData data = runData.get(runId);
+
+               //extract according baseline values
+               //TODO baseLineRunIds may be null
+               String baselineO = null;
+               Optional<Map.Entry<Integer, TableReport.RunData>> baseline = runData.entrySet().stream()
+                       .filter(s -> baseLineRunIds.contains(s)
+                               && s.getValue().category.equals(data.category)
+                               && s.getValue().label.equals(data.label)
+                               && s.getValue().series.equals(data.series)).findFirst();
+               if (baseline.isPresent()){
+                  baselineO =  baseline.get().getValue().values.toString();
+               }
+
+               //here I need to get baseline runId
                if (nullOrEmpty(component.function)) {
                   if (row[1] == null) {
                      data.values.addNull();
                   } else {
                      Double dValue = Util.toDoubleOrNull(row[1]);
                      if (dValue != null) {
+                        //single value
                         data.values.add(dValue);
+                        if (baseLineRunIds != null)  data.relative_difference.add(getDifference(baselineO, dValue));
                      } else {
-                        data.values.add(String.valueOf(row[1]));
+                        //array values
+                        String sValue = String.valueOf(row[1]);
+                        data.values.add(sValue);
+                        if (baseLineRunIds != null)  data.relative_difference.add(getDifferenceA(baselineO, sValue));
                      }
                   }
                } else {
@@ -369,8 +404,11 @@ public class ReportServiceImpl implements ReportService {
                      Value value = context.eval("js", jsCode);
                      Double maybeDouble = Util.toDoubleOrNull(value, err -> {}, info -> {});
                      if (maybeDouble != null) {
+                        //single value
                         data.values.add(maybeDouble);
+                        if (baseLineRunIds != null)  data.relative_difference.add(getDifference(baselineO, maybeDouble));
                      } else {
+                        //array values or object
                         data.values.add(Util.convertToJson(value));
                      }
                   } catch (PolyglotException e) {
@@ -381,8 +419,57 @@ public class ReportServiceImpl implements ReportService {
             }
          }
       });
-      report.runData = runIds.stream().map(runData::get).collect(Collectors.toList());
-      return report;
+   }
+
+   private Double getDifference(Object baseline, Double dValue) {
+    Double relative = null;
+         Double baselineValue = Util.toDoubleOrNull(baseline);
+         if (baseline!=null) {
+            relative = getRelativePercentage(baselineValue, dValue);
+         }
+      return relative;
+   }
+
+
+   private String getDifferenceA(String baseline, String sValue) {
+      String differences = null;
+      try {
+         Double[] newValuesD = mapper.readValue(sValue, Double[].class);
+         Double[] baselineD = mapper.readValue(baseline, Double[].class);
+         Double[] result = new Double[newValuesD.length];
+         for (int i = 0; i < newValuesD.length ; i++) {
+            result[i] = getRelativePercentage(baselineD[i], newValuesD[i]);
+         }
+         differences = mapper.writeValueAsString(result);
+
+      } catch (JsonProcessingException e) {
+         log.errorf(e, "Failed to get relative difference new value is %s, baseline is %s.", sValue, baseline );
+      }
+      return differences;
+
+//      String jsCode = buildCode(component.function, sValue);
+//
+//      String jsCode = "({score_b, score}) => {\n" +
+//              "   const obj = {}\n" +
+//              "   score.forEach((sc, i) => {\n" +
+//              "                     sc = (sc[i]/score_b[i]-1)*100;\n" +
+//              "   })\n" +
+//              "   return obj\n" +
+//              "}\n";
+
+//      if (baseline.isPresent()) {
+//         Double baselineValue = baseline.get().getValue().values.get(0).doubleValue();
+//         relative =  getRelativePercentage(baselineValue, sValue);
+//      }
+//      return relative;
+   }
+
+   private Double getRelativePercentage(Double baseLineScore, Double newValue) {
+      if (baseLineScore ==null || baseLineScore==0) {
+         log.errorf("Failed to provide relative difference for baseline %d and new value %d ", baseLineScore, newValue);
+         return null;
+      }
+      return newValue/baseLineScore;
    }
 
    private boolean nullOrEmpty(String str) {
@@ -401,6 +488,7 @@ public class ReportServiceImpl implements ReportService {
             TableReport.RunData data = new TableReport.RunData();
             data.runId = runId;
             data.values = JsonNodeFactory.instance.arrayNode(config.components.size());
+            data.relative_difference = JsonNodeFactory.instance.arrayNode(config.components.size());
             if (nullOrEmpty(config.categoryFunction)) {
                data.category = Util.unwrapDoubleQuotes((String) row[1]);
             } else {
